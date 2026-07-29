@@ -30,4 +30,4 @@ flutter build apk --release
 
 ## Лицензия
 
-MIT
+[MIT](LICENSE)
