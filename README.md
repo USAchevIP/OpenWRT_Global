@@ -1,4 +1,4 @@
-# OpenWRT Manager
+# OpenWRT Global Manager
 
 Мобильное приложение для управления роутерами OpenWRT через SSH.
 
