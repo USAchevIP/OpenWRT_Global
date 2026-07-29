@@ -30,4 +30,4 @@ flutter build apk --release
 
 ## Лицензия
 
-[MIT](LICENSE)
+[MIT](LICENSE) — разрешено использовать, модифицировать и распространять код при условии указания автора **Усачёв Денис (РыбинскLAB.ru)** и ссылки на репозиторий **https://github.com/USAchevIP/OpenWRT_Global**.
