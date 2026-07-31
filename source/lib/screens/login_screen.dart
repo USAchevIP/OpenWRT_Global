@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../models/router_connection.dart';
 import '../services/storage_service.dart';
+import '../services/openwrt_service.dart';
 import 'home_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -17,8 +19,9 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
   final _form = GlobalKey<FormState>();
   final _name = TextEditingController(), _host = TextEditingController();
   final _port = TextEditingController(text: '22'), _user = TextEditingController(text: 'root');
-  final _pass = TextEditingController();
+  final _pass = TextEditingController(), _keyCtrl = TextEditingController();
   bool _obscure = true;
+  bool _useKey = false;
 
   @override
   void initState() {
@@ -30,7 +33,7 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
   @override
   void dispose() {
     _anim.dispose();
-    _name.dispose(); _host.dispose(); _port.dispose(); _user.dispose(); _pass.dispose();
+    _name.dispose(); _host.dispose(); _port.dispose(); _user.dispose(); _pass.dispose(); _keyCtrl.dispose();
     super.dispose();
   }
 
@@ -66,8 +69,9 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
     if (cfg != null) {
       _name.text = cfg.name; _host.text = cfg.host; _port.text = cfg.port.toString();
       _user.text = cfg.username; _pass.text = cfg.password;
+      _keyCtrl.text = cfg.sshKey ?? ''; _useKey = cfg.useKey;
     } else {
-      _name.clear(); _host.clear(); _port.text = '22'; _user.text = 'root'; _pass.clear();
+      _name.clear(); _host.clear(); _port.text = '22'; _user.text = 'root'; _pass.clear(); _keyCtrl.clear(); _useKey = false;
     }
     _obscure = true;
 
@@ -97,15 +101,86 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
                   Expanded(flex: 3, child: TextFormField(controller: _user, decoration: const InputDecoration(labelText: 'Пользователь', prefixIcon: Icon(Icons.person)), validator: (v) => v == null || v.isEmpty ? 'Обязательно' : null)),
                 ]),
                 const SizedBox(height: 12),
-                TextFormField(
-                  controller: _pass, obscureText: _obscure,
-                  decoration: InputDecoration(labelText: 'Пароль', prefixIcon: const Icon(Icons.lock), suffixIcon: IconButton(icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility), onPressed: () => setSt(() => _obscure = !_obscure))),
-                  validator: (v) => v == null || v.isEmpty ? 'Обязательно' : null,
+                // Переключатель: пароль / ключ
+                Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Theme.of(ctx).colorScheme.outlineVariant),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Column(
+                    children: [
+                      SwitchListTile(
+                        value: _useKey,
+                        onChanged: (v) => setSt(() => _useKey = v),
+                        title: const Text('SSH-ключ', style: TextStyle(fontSize: 14)),
+                        subtitle: Text(_useKey ? 'Войдите по ключу (PEM)' : 'Войдите по паролю', style: TextStyle(fontSize: 12, color: Theme.of(ctx).colorScheme.onSurfaceVariant)),
+                        secondary: Icon(_useKey ? Icons.vpn_key : Icons.lock),
+                      ),
+                      if (!_useKey)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                          child: TextFormField(
+                            controller: _pass, obscureText: _obscure,
+                            decoration: InputDecoration(
+                              labelText: 'Пароль',
+                              prefixIcon: const Icon(Icons.lock, size: 20),
+                              suffixIcon: IconButton(icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility, size: 20), onPressed: () => setSt(() => _obscure = !_obscure)),
+                              isDense: true,
+                            ),
+                            validator: (v) => _useKey ? null : (v == null || v.isEmpty ? 'Обязательно' : null),
+                          ),
+                        ),
+                      if (_useKey)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                          child: Column(
+                            children: [
+                              TextFormField(
+                                controller: _keyCtrl, maxLines: 6,
+                                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                                decoration: InputDecoration(
+                                  labelText: 'Приватный ключ (PEM)',
+                                  prefixIcon: const Padding(
+                                    padding: EdgeInsets.only(bottom: 80),
+                                    child: Icon(Icons.vpn_key, size: 20),
+                                  ),
+                                  isDense: true,
+                                ),
+                                validator: (v) => !_useKey ? null : (v == null || v.isEmpty ? 'Вставьте ключ' : null),
+                              ),
+                              const SizedBox(height: 6),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text('Нажмите "Вставить" чтобы вставить ключ из буфера',
+                                        style: TextStyle(fontSize: 11, color: Theme.of(ctx).colorScheme.onSurfaceVariant)),
+                                  ),
+                                  if (_host.text.isNotEmpty && _user.text.isNotEmpty)
+                                    TextButton.icon(
+                                      onPressed: () => _generateKey(ctx, setSt),
+                                      icon: const Icon(Icons.auto_fix_high, size: 16),
+                                      label: const Text('Создать ключ', style: TextStyle(fontSize: 12)),
+                                    ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
                 const SizedBox(height: 24),
                 FilledButton(onPressed: () {
                   if (_form.currentState!.validate()) {
-                    _save(RouterConnection(name: _name.text.trim(), host: _host.text.trim(), port: int.tryParse(_port.text) ?? 22, username: _user.text.trim(), password: _pass.text));
+                    _save(RouterConnection(
+                      name: _name.text.trim(),
+                      host: _host.text.trim(),
+                      port: int.tryParse(_port.text) ?? 22,
+                      username: _user.text.trim(),
+                      password: _pass.text,
+                      sshKey: _useKey ? _keyCtrl.text.trim() : null,
+                      useKey: _useKey,
+                    ));
                     Navigator.pop(ctx);
                   }
                 }, child: Text(cfg == null ? 'Добавить' : 'Сохранить')),
@@ -114,7 +189,40 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
           ),
         ),
       ),
+);
+  }
+
+  Future<void> _generateKey(BuildContext ctx, StateSetter setSt) async {
+    // Сначала подключаемся по паролю
+    final config = RouterConnection(
+      name: _name.text.trim(),
+      host: _host.text.trim(),
+      port: int.tryParse(_port.text) ?? 22,
+      username: _user.text.trim(),
+      password: _pass.text,
     );
+    final service = OpenWrtService(config);
+    setSt(() {});
+    try {
+      await service.connect();
+      final keys = await service.generateAndInstallKey();
+      await service.disconnect();
+      _keyCtrl.text = keys['private'] ?? '';
+      setSt(() {});
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(
+          content: Text('SSH-ключ создан и установлен на роутер!'),
+          backgroundColor: Colors.green,
+        ));
+      }
+    } catch (e) {
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+          content: Text('Ошибка: ${e.toString().replaceAll(config.password, '***')}'),
+          backgroundColor: Colors.red,
+        ));
+      }
+    }
   }
 
   @override
@@ -170,12 +278,12 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
                               child: Padding(
                                 padding: const EdgeInsets.all(14),
                                 child: Row(children: [
-                                  CircleAvatar(radius: 26, backgroundColor: t.colorScheme.primaryContainer, child: Icon(Icons.router, color: t.colorScheme.onPrimaryContainer)),
+                                  CircleAvatar(radius: 26, backgroundColor: t.colorScheme.primaryContainer, child: Icon(r.useKey ? Icons.vpn_key : Icons.router, color: t.colorScheme.onPrimaryContainer)),
                                   const SizedBox(width: 16),
                                   Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                                     Text(r.name, style: t.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
                                     const SizedBox(height: 2),
-                                    Text('${r.username}@${r.host}:${r.port}', style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant)),
+                                    Text('${r.username}@${r.host}:${r.port}${r.useKey ? ' (ключ)' : ''}', style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant)),
                                   ])),
                                   IconButton(icon: const Icon(Icons.edit_outlined, size: 20), onPressed: () => _sheet(r, i)),
                                   IconButton(icon: Icon(Icons.delete_outline, size: 20, color: t.colorScheme.error), onPressed: () => _del(i)),

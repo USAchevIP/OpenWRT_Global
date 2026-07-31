@@ -15,6 +15,7 @@ class _VpnScreenState extends State<VpnScreen> {
   List<VpnInterface> vpns = [];
   bool loading = true;
   String? error;
+  String? _toggling;
 
   @override
   void initState() {
@@ -41,15 +42,46 @@ class _VpnScreenState extends State<VpnScreen> {
 
   Future<void> _toggle(VpnInterface v) async {
     try {
+      setState(() => _toggling = v.name);
       if (v.up) {
+        // Выключение
         await widget.service.vpnDown(v.name);
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('${v.name} выключен')));
       } else {
+        // Взаимное исключение: выключаем другие VPN того же типа
+        final others = vpns.where((o) =>
+            o.name != v.name &&
+            o.up &&
+            ((v.type == 'WireGuard' || v.type == 'AmneziaWG') &&
+             (o.type == 'WireGuard' || o.type == 'AmneziaWG') ||
+             (v.type == 'OpenVPN' && o.type == 'OpenVPN')));
+        for (final other in others) {
+          await widget.service.vpnDown(other.name);
+          await Future.delayed(const Duration(milliseconds: 500));
+        }
+        // Включение
         await widget.service.vpnUp(v.name);
+        // Проверка IP (до 15 сек)
+        if (v.type == 'WireGuard' || v.type == 'AmneziaWG' || v.type == 'OpenVPN') {
+          final oldIp = await widget.service.fetchPublicIp();
+          for (int i = 0; i < 15; i++) {
+            await Future.delayed(const Duration(seconds: 1));
+            try {
+              final newIp = await widget.service.fetchPublicIp();
+              if (newIp != oldIp && !newIp.contains('недоступно')) break;
+            } catch (_) {}
+          }
+        }
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('${v.name} включён')));
       }
       await _load();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Ошибка: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Ошибка: $e'), backgroundColor: Colors.red.shade700));
+    } finally {
+      if (mounted) setState(() => _toggling = null);
     }
   }
 
@@ -396,10 +428,12 @@ class _VpnScreenState extends State<VpnScreen> {
                                 ),
                                 title: Text(v.name, style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
                                 subtitle: Text(v.type),
-                                trailing: Switch(
-                                  value: v.up,
-                                  onChanged: (_) => _toggle(v),
-                                ),
+trailing: _toggling == v.name
+                                    ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+                                    : Switch(
+                                        value: v.up,
+                                        onChanged: (_) => _toggle(v),
+                                      ),
                               ),
                               Row(
                                 children: [

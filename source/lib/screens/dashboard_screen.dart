@@ -41,7 +41,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       try {
         final clients = await widget.service.fetchClientsWithTraffic();
         for (final c in clients) {
-          if (c.connectionType == 'Wi-Fi') w++; else l++;
+          if (c.connectionType?.contains('Wi-Fi') == true) w++; else l++;
         }
       } catch (_) {}
 
@@ -131,6 +131,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
       Text(label, style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant)),
       Text(value, style: t.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w700, fontSize: 13), maxLines: 1, overflow: TextOverflow.ellipsis),
       if (sub != null) Text(sub, style: t.textTheme.bodySmall?.copyWith(fontSize: 10, color: t.colorScheme.onSurfaceVariant)),
+      if (label == 'Интернет' && internetOk && publicIp.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: SelectableText('IP: $publicIp', style: TextStyle(fontSize: 10, color: t.colorScheme.onSurfaceVariant, fontFamily: 'monospace')),
+        ),
     ]))),
   );
 

@@ -8,6 +8,7 @@ import '../models/client_info.dart';
 import '../models/package_info.dart';
 import '../models/network_info.dart';
 import '../models/vpn_info.dart';
+import '../models/channel_scan_result.dart';
 
 class OpenWrtService {
   final RouterConnection config;
@@ -19,14 +20,26 @@ class OpenWrtService {
 
   bool get isConnected => _connected;
 
+  SSHClient? get sshClient => _client;
+
   Future<void> connect() async {
     try {
       final socket = await SSHSocket.connect(config.host, config.port);
-      _client = SSHClient(
-        socket,
-        username: config.username,
-        onPasswordRequest: () => config.password,
-      );
+      if (config.useKey && config.sshKey != null && config.sshKey!.isNotEmpty) {
+        final keyPairs = SSHKeyPair.fromPem(config.sshKey!);
+        _client = SSHClient(
+          socket,
+          username: config.username,
+          identities: keyPairs,
+          onPasswordRequest: () => null,
+        );
+      } else {
+        _client = SSHClient(
+          socket,
+          username: config.username,
+          onPasswordRequest: () => config.password,
+        );
+      }
       await _client!.run('echo ok');
       _startKeepAlive();
       _connected = true;
@@ -233,6 +246,149 @@ class OpenWrtService {
     return channels;
   }
 
+  Future<List<ChannelScanResult>> scanWifiChannelsDetailed(String device) async {
+    final raw = await runCommand('iwinfo $device scan 2>/dev/null || iw dev $device scan 2>/dev/null || echo ""');
+    final results = <ChannelScanResult>[];
+    String? currentSsid, currentBssid, currentSig, currentCh;
+    int currentWidth = 20;
+    int currentCenterFreq = 0;
+
+    for (final line in LineSplitter.split(raw)) {
+      final trimmed = line.trim();
+
+      // Новая BSS (точка доступа)
+      if (trimmed.startsWith('BSS ') || trimmed.startsWith('ESSID:') || trimmed.startsWith('SSID:')) {
+        _finalizeScanResult(results, currentSsid, currentBssid, currentSig, currentCh, currentWidth, currentCenterFreq);
+        if (trimmed.startsWith('BSS ')) {
+          currentBssid = trimmed.split(' ')[1].toLowerCase();
+          currentSsid = null; currentSig = null; currentCh = null;
+          currentWidth = 20; currentCenterFreq = 0;
+        } else {
+          currentSsid = trimmed.substring(trimmed.indexOf(':') + 1).trim().replaceAll('"', '').replaceAll("'", '');
+          currentBssid = null; currentSig = null; currentCh = null;
+          currentWidth = 20; currentCenterFreq = 0;
+        }
+        continue;
+      }
+
+      if (trimmed.startsWith('BSSID:')) {
+        final m = RegExp(r'([0-9a-fA-F:]{17})').firstMatch(trimmed);
+        if (m != null) currentBssid = m.group(1)!.toLowerCase();
+      }
+
+      // Сигнал
+      if (currentSig == null) {
+        final sigMatch = RegExp(r'Signal:\s*(-?\d+)\s*dBm|signal:\s*(-?\d+)', caseSensitive: false).firstMatch(trimmed);
+        if (sigMatch != null) currentSig = sigMatch.group(1) ?? sigMatch.group(2);
+      }
+
+      // Канал
+      if (currentCh == null) {
+        final chMatch = RegExp(r'Channel:\s*(\d+)|channel:\s*(\d+)', caseSensitive: false).firstMatch(trimmed);
+        if (chMatch != null) currentCh = chMatch.group(1) ?? chMatch.group(2);
+      }
+
+      // Ширина канала: HT operation → STA channel width
+      if (trimmed.contains('STA channel width:') || trimmed.contains('channel width:')) {
+        final m = RegExp(r'(\d+)\s*MHz').firstMatch(trimmed);
+        if (m != null) {
+          final w = int.tryParse(m.group(1)!) ?? 20;
+          if (w >= 20 && w <= 320) currentWidth = w;
+        }
+      }
+      // HE operation parameters
+      if (trimmed.contains('HE operation parameters:')) {
+        final m = RegExp(r'(\d+)\s*MHz').firstMatch(trimmed);
+        if (m != null) {
+          final w = int.tryParse(m.group(1)!) ?? 20;
+          if (w >= 20 && w <= 320) currentWidth = w;
+        }
+      }
+      // secondary channel offset for HT40 detection
+      if (trimmed.contains('secondary channel offset:') && trimmed.contains('above') || trimmed.contains('below')) {
+        if (currentWidth == 20) currentWidth = 40;
+      }
+
+      // Центральная частота
+      if (trimmed.contains('center freq segment') || trimmed.contains('Center freq')) {
+        final cf = RegExp(r'(\d+)').firstMatch(trimmed);
+        if (cf != null) {
+          final freq = int.tryParse(cf.group(1)!) ?? 0;
+          if (freq > 1000 && freq != currentCenterFreq) currentCenterFreq = freq;
+        }
+      }
+    }
+    _finalizeScanResult(results, currentSsid, currentBssid, currentSig, currentCh, currentWidth, currentCenterFreq);
+    return results;
+  }
+
+  void _finalizeScanResult(List<ChannelScanResult> results, String? ssid, String? bssid, String? sig, String? ch, int width, int centerFreq) {
+    if (ch == null) return;
+    final channel = int.tryParse(ch);
+    if (channel == null || channel == 0) return;
+    final centerCh = centerFreq > 0 ? (centerFreq - 2407) ~/ 5 : channel;
+    results.add(ChannelScanResult(
+      channel: channel,
+      frequency: centerFreq > 0 ? centerFreq : (channel * 5 + 2407),
+      width: width,
+      centerChannel: centerCh,
+      signalStrength: int.tryParse(sig ?? '-100') ?? -100,
+      ssid: ssid ?? '',
+      bssid: bssid ?? '',
+      source: 'router',
+    ));
+  }
+
+  /// Wi-Fi аудит безопасности: WPS, перехват PMKID, чтение пароля из UCI
+  Future<Map<String, dynamic>> wifiSecurityAudit(String iface, String bssid) async {
+    final result = <String, dynamic>{
+      'wps': false, 'locked': false, 'password': null,
+      'method': null, 'pmkid': null, 'encryption': null,
+    };
+    // 1. WPS статус
+    final raw = await runCommand('iw dev $iface scan 2>/dev/null | grep -A 30 "BSS $bssid" || echo ""');
+    result['wps'] = raw.contains('WPS:');
+    result['locked'] = raw.contains('0x15');
+    // 2. Шифрование
+    if (raw.contains('WPA3') || raw.contains('SAE')) result['encryption'] = 'WPA3';
+    else if (raw.contains('WPA2') || raw.contains('CCMP')) result['encryption'] = 'WPA2';
+    else if (raw.contains('WPA')) result['encryption'] = 'WPA';
+    else if (raw.contains('WEP')) result['encryption'] = 'WEP';
+    else result['encryption'] = 'Открытая';
+    // 3. Пароль из UCI (если наша сеть)
+    try {
+      final networks = await fetchWifiNetworks();
+      for (final n in networks) {
+        if (n.ssid == (result['ssid'] ?? '')) {
+          final key = await runCommand('uci get wireless.${n.section}.key 2>/dev/null || echo ""');
+          if (key.trim().isNotEmpty) {
+            result['password'] = key.trim();
+            result['method'] = 'uci_config';
+          }
+          break;
+        }
+      }
+    } catch (_) {}
+    // 4. Попытка перехвата PMKID через hcxdumptool (если установлен)
+    try {
+      final hasHcx = await runCommand('which hcxdumptool 2>/dev/null && echo OK || echo NO').then((s) => s.trim());
+      if (hasHcx == 'OK') {
+        await runCommand('timeout 10 hcxdumptool -i $iface -o /tmp/pmkid.pcapng --enable_status=1 2>/dev/null || true');
+        final hasFile = await runCommand('test -s /tmp/pmkid.pcapng && echo OK || echo NO').then((s) => s.trim());
+        if (hasFile == 'OK') {
+          await runCommand('hcxpcapngtool -o /tmp/hash.txt /tmp/pmkid.pcapng 2>/dev/null || true');
+          final pass = await runCommand('hashcat -m 22000 /tmp/hash.txt --show 2>/dev/null | head -1 || echo ""');
+          if (pass.trim().isNotEmpty && !pass.contains('hashcat') && !pass.contains('Separator')) {
+            result['password'] = pass.trim().split(':').last;
+            result['method'] = 'pmkid_crack';
+            result['pmkid'] = '/tmp/hash.txt';
+          }
+        }
+      }
+    } catch (_) {}
+    return result;
+  }
+
   Future<int?> recommendChannel(String device) async {
     final channels = await scanWifiChannels(device);
     if (channels.isEmpty) return null;
@@ -310,39 +466,93 @@ class OpenWrtService {
   }
 
   Future<String> runSpeedtest() async {
-    // speedtest-netperf (в PATH)
+    // Метод 1: iperf3 (если установлен)
     try {
-      final r = await runCommand('speedtest-netperf 2>/dev/null');
-      if (r.isNotEmpty && (r.contains('Download') || r.contains('download'))) return _fmt(r);
-    } catch (_) {}
-    // curl с замером (самый надёжный)
-    try {
-      final r = await runCommand('curl -o /dev/null -w "DL|%{speed_download}|UL|%{speed_upload}|SIZE|%{size_download}|TIME|%{time_total}" -s http://speedtest.tele2.net/10MB.zip 2>/dev/null; echo OK');
-      if (r.contains('OK')) {
-        final dl = _extract(r, 'DL|', '|UL'); final ul = _extract(r, 'UL|', '|SIZE');
-        final sz = _extract(r, 'SIZE|', '|TIME'); final tm = _extract(r, 'TIME|', null);
-        final dlMbps = ((double.tryParse(dl) ?? 0) * 8 / 1000000).toStringAsFixed(1);
-        final ulMbps = ((double.tryParse(ul) ?? 0) * 8 / 1000000).toStringAsFixed(1);
-        final szMB = ((double.tryParse(sz) ?? 0) / 1048576).toStringAsFixed(1);
-        return 'Входящая: $dlMbps Мбит/с (≈${((double.tryParse(dl) ?? 0) / 125000).toStringAsFixed(1)} МБ/с)\nИсходящая: $ulMbps Мбит/с\nСкачано: $szMB МБ за $tm сек';
+      final hasIperf = await runCommand('which iperf3 2>/dev/null && echo OK || echo NO').then((s) => s.trim());
+      if (hasIperf == 'OK') {
+        // Ищем публичный iperf3 сервер
+        final servers = [
+          'iperf.volia.net:5201',
+          'iperf.he.net:5201',
+          'iperf.online.net:5201',
+        ];
+        for (final server in servers) {
+          try {
+            final r = await runCommand('iperf3 -c ${server.split(':')[0]} -p ${server.split(':')[1]} -t 10 -f m 2>&1 | tail -5').timeout(const Duration(seconds: 20));
+            if (r.contains('receiver') || r.contains('sender')) {
+              final dlMatch = RegExp(r'(\d+\.?\d*)\s*Mbits/sec').firstMatch(r);
+              if (dlMatch != null) {
+                return 'iperf3: ${dlMatch.group(1)} Мбит/с\nСервер: $server';
+              }
+            }
+          } catch (_) {
+            continue;
+          }
+        }
       }
     } catch (_) {}
-    // wget
+
+    // Метод 2: speedtest-netperf (если установлен)
     try {
-      final r = await runCommand('wget -O /dev/null http://speedtest.tele2.net/1MB.zip 2>&1; echo OK');
+      final hasNetperf = await runCommand('which speedtest-netperf 2>/dev/null && echo OK || echo NO').then((s) => s.trim());
+      if (hasNetperf == 'OK') {
+        final r = await runCommand('speedtest-netperf 2>/dev/null').timeout(const Duration(seconds: 45));
+        if (r.isNotEmpty && (r.contains('Download') || r.contains('download'))) {
+          final dl = RegExp(r'Download:\s*(\d+\.?\d*)\s*(Mbps|Mbit)', caseSensitive: false).firstMatch(r);
+          final ul = RegExp(r'Upload:\s*(\d+\.?\d*)\s*(Mbps|Mbit)', caseSensitive: false).firstMatch(r);
+          return 'speedtest-netperf:\n'
+              '${dl != null ? "Входящая: ${dl.group(1)} Мбит/с" : ""}\n'
+              '${ul != null ? "Исходящая: ${ul.group(1)} Мбит/с" : ""}';
+        }
+      }
+    } catch (_) {}
+
+    // Метод 3: curl с замером (самый надёжный)
+    try {
+      final hasCurl = await runCommand('which curl 2>/dev/null && echo OK || echo NO').then((s) => s.trim());
+      if (hasCurl == 'OK') {
+        final r = await runCommand(
+          'curl -o /dev/null -w "DL|%{speed_download}|UL|%{speed_upload}|SIZE|%{size_download}|TIME|%{time_total}" -s '
+          'http://speedtest.tele2.net/10MB.zip 2>/dev/null; echo OK'
+        ).timeout(const Duration(seconds: 60));
+        if (r.contains('OK')) {
+          final dl = _extract(r, 'DL|', '|UL');
+          final ul = _extract(r, 'UL|', '|SIZE');
+          final sz = _extract(r, 'SIZE|', '|TIME');
+          final tm = _extract(r, 'TIME|', null);
+          final dlMbps = ((double.tryParse(dl) ?? 0) * 8 / 1000000).toStringAsFixed(1);
+          final ulMbps = ((double.tryParse(ul) ?? 0) * 8 / 1000000).toStringAsFixed(1);
+          final szMB = ((double.tryParse(sz) ?? 0) / 1048576).toStringAsFixed(1);
+          return 'curl speedtest:\n'
+              'Входящая: $dlMbps Мбит/с\n'
+              'Исходящая: $ulMbps Мбит/с\n'
+              'Скачано: $szMB МБ за $tm сек';
+        }
+      }
+    } catch (_) {}
+
+    // Метод 4 (fallback): wget
+    try {
+      final r = await runCommand(
+        'wget -O /dev/null http://speedtest.tele2.net/1MB.zip 2>&1; echo OK'
+      ).timeout(const Duration(seconds: 30));
       if (r.contains('OK')) {
         for (final line in LineSplitter.split(r)) {
           final m = RegExp(r'(\d+\.?\d*)\s*([KM])B/s', caseSensitive: false).firstMatch(line);
           if (m != null) {
-            final s = double.tryParse(m.group(1)!) ?? 0;
-            final mbps = (m.group(2)!.toUpperCase() == 'K' ? s * 8 / 1000 : s * 8).toStringAsFixed(1);
-            return 'Входящая: $mbps Мбит/с (≈${((double.tryParse(mbps) ?? 0) / 8).toStringAsFixed(1)} МБ/с)';
+            final speed = double.tryParse(m.group(1)!) ?? 0;
+            final mbps = (m.group(2)!.toUpperCase() == 'K' ? speed * 8 / 1000 : speed * 8).toStringAsFixed(1);
+            return 'wget speedtest:\nВходящая: $mbps Мбит/с';
           }
         }
-        return 'Тест завершён (wget). Для точных цифр: opkg install curl';
+        return 'wget speedtest: тест завершён, но скорость не распознана.\nУстановите: opkg install curl iperf3';
       }
     } catch (_) {}
-    return 'Не удалось. opkg install curl speedtest-netperf';
+
+    // Ничего не сработало
+    return 'Speedtest не выполнен.\n'
+        'Установите: opkg update && opkg install curl iperf3 speedtest-netperf\n'
+        'Или проверьте интернет на роутере';
   }
 
   String _extract(String s, String start, String? end) {
@@ -627,28 +837,88 @@ wifi reload
     }
   }
 
-  Future<Map<String, dynamic>> aiOptimizeWifi(String device) async {
+  Future<Map<String, dynamic>> aiOptimizeWifi(String device, {List<ChannelScanResult>? phoneScans}) async {
     final scan = await scanWifiChannels(device);
     final allCh = await getAvailableChannels(device);
     final hts = await getAvailableHtModes(device);
+    final band = await runCommand('uci get wireless.$device.band 2>/dev/null || echo "2.4g"').then((s) => s.trim());
+
+    // Определяем какие каналы реально заняты с учётом ширины
+    final occupied = <int, int>{}; // канал -> вес помех
+
+    // Данные с роутера
+    for (final entry in scan.entries) {
+      final ch = entry.key;
+      final count = entry.value;
+      // Соседние каналы тоже учитываем (co-channel interference)
+      for (int c = ch - 2; c <= ch + 2; c++) {
+        if (c >= 1) occupied[c] = (occupied[c] ?? 0) + count;
+      }
+    }
+
+    // Данные с телефона (если есть)
+    if (phoneScans != null) {
+      for (final ps in phoneScans) {
+        for (final ch in ps.occupiedChannels) {
+          occupied[ch] = (occupied[ch] ?? 0) + 2; // телефон = больший вес
+        }
+        // Сигнал > -50dBm = очень сильный сигнал = больше помех
+        if (ps.signalStrength > -50) {
+          for (final ch in ps.occupiedChannels) {
+            occupied[ch] = (occupied[ch] ?? 0) + 2;
+          }
+        }
+      }
+    }
 
     final result = <String, dynamic>{
       'channels': scan,
       'available_channels': allCh,
       'available_ht_modes': hts,
+      'phone_scans': phoneScans?.length ?? 0,
     };
 
-    int? bestCh; int bestCount = 999; String bestHt = hts.isNotEmpty ? hts[0] : 'HT20';
+    // Выбираем лучший канал
+    int? bestCh;
+    int bestScore = 999999;
     for (final ch in allCh) {
-      final count = scan[ch] ?? 0;
-      if (count < bestCount) { bestCount = count; bestCh = ch; }
+      final score = occupied[ch] ?? 0;
+      if (score < bestScore) {
+        bestScore = score;
+        bestCh = ch;
+      }
     }
-    if (bestCount == 0 && hts.any((h) => h.contains('HE') || h.contains('VHT'))) {
-      bestHt = hts.firstWhere((h) => h.contains('80') || h.contains('160'), orElse: () => hts.first);
+
+    // Выбираем лучшую ширину канала
+    String bestHt = hts.isNotEmpty ? hts[0] : 'HT20';
+    final is5G = band == '5g' || band == '6g';
+    final maxNoise = occupied.values.isEmpty ? 0 : occupied.values.reduce((a, b) => a > b ? a : b);
+
+    if (is5G) {
+      // Для 5GHz: если эфир чистый, используем HE160, если немного зашумлён — HE80, иначе HE40
+      if (maxNoise <= 2 && hts.any((h) => h.contains('160'))) {
+        bestHt = hts.firstWhere((h) => h.contains('160'), orElse: () => hts.firstWhere((h) => h.contains('80'), orElse: () => hts[0]));
+      } else if (maxNoise <= 5 && hts.any((h) => h.contains('80'))) {
+        bestHt = hts.firstWhere((h) => h.contains('80') && !h.contains('160'), orElse: () => hts[0]);
+      } else if (maxNoise <= 10 && hts.any((h) => h.contains('40'))) {
+        bestHt = hts.firstWhere((h) => h.contains('40') && !h.contains('80') && !h.contains('160'), orElse: () => hts[0]);
+      } else {
+        bestHt = hts.contains('HT20') ? 'HT20' : hts[0];
+      }
+    } else {
+      // Для 2.4GHz: максимум HT40 (и то, если эфир чистый)
+      if (maxNoise <= 3 && hts.any((h) => h.contains('40'))) {
+        bestHt = hts.firstWhere((h) => h.contains('40') && !h.contains('80'), orElse: () => hts[0]);
+      } else {
+        bestHt = 'HT20';
+      }
     }
+
     result['recommended_channel'] = bestCh;
     result['recommended_htmode'] = bestHt;
-    result['interference_level'] = bestCount;
+    result['interference_level'] = bestScore;
+    result['max_noise'] = maxNoise;
+    result['band'] = band;
     return result;
   }
 
@@ -798,14 +1068,29 @@ echo "$stopM $stopH * * * nft delete element inet fw4 blocklist { $cleanMac } 2>
     if (v.contains('broadcom') || v.contains('qualcomm')) return 'Чипсет';
     if (v.contains('nvidia')) return 'NVIDIA Shield';
 
-    // Если есть IP, пробуем быстро сканировать порты
+    // Если есть IP, пробуем OS fingerprinting по портам
+    if (ip != null && ip != '-' && ip != '0.0.0.0') {
+      try {
+        final ports = await runCommand('timeout 3 nmap -sS -F --top-ports 50 -T4 $ip 2>/dev/null | grep open || echo ""');
+        final openPorts = ports.split('\n').map((l) => l.trim()).where((l) => l.contains('open')).join('\n');
+        if (openPorts.contains('port 21') || openPorts.contains('22/tcp') || openPorts.contains('23/tcp')) return 'Linux/OpenWrt';
+        if (openPorts.contains('554/tcp') || openPorts.contains('37777/tcp')) return 'IP-камера';
+        if (openPorts.contains('9100/tcp')) return 'Принтер';
+        if (openPorts.contains('3389/tcp') || openPorts.contains('445/tcp') || openPorts.contains('139/tcp')) return 'ПК Windows';
+        if (openPorts.contains('62078/tcp')) return 'iPhone (синхронизация)';
+        if (openPorts.contains('5357/tcp') || openPorts.contains('903/tcp')) return 'Windows';
+        if (openPorts.contains('1900/tcp') || openPorts.contains('1900/udp')) return 'UPnP устройство';
+        if (openPorts.contains('53/tcp')) return 'DNS-сервер';
+      } catch (_) {}
+    }
+
+    // Stryker-style: проверяем специфичные порты через /proc/net/tcp на роутере
     if (ip != null && ip != '-') {
       try {
-        final ports = await runCommand('timeout 2 nmap --open -p 8008,8009,5353,515,9100,22,23 $ip 2>/dev/null | grep open || echo ""');
-        if (ports.contains('8008') || ports.contains('8009')) return 'Chromecast / TV';
-        if (ports.contains('5353')) return 'Устройство с mDNS';
-        if (ports.contains('515') || ports.contains('9100')) return 'Принтер';
-        if (ports.contains('22')) return 'Linux/Роутер';
+        final conntrack = await runCommand('conntrack -L 2>/dev/null | grep "$ip" | awk \'{print \$5}\' | sort -u | head -10 || echo ""');
+        if (conntrack.contains('554') || conntrack.contains('37777')) return 'IP-камера';
+        if (conntrack.contains('9100')) return 'Принтер';
+        if (conntrack.contains('3389')) return 'ПК Windows';
       } catch (_) {}
     }
 
@@ -846,8 +1131,18 @@ echo "$stopM $stopH * * * nft delete element inet fw4 blocklist { $cleanMac } 2>
     }
   }
 
-  Future<List<Map<String, String>>> runNmapScan() async {
-    final raw = await runCommand('nmap -sn 192.168.1.0/24 2>/dev/null || echo ""');
+  static const Map<String, String> nmapProfiles = {
+    'quick': '-sn -PE -n',
+    'fast': '-sS -F --top-ports 100 -T4',
+    'standard': '-sV -T4',
+    'full': '-sV -p- -T4 -v',
+    'intense': '-O -sV -sC -A -T4 -v',
+    'udp': '-sU -F --top-ports 50',
+  };
+
+  Future<List<Map<String, String>>> runNmapScan({String target = '192.168.1.0/24', String profile = 'quick'}) async {
+    final flags = nmapProfiles[profile] ?? nmapProfiles['quick']!;
+    final raw = await runCommand('nmap $target $flags 2>/dev/null || echo ""');
     final result = <Map<String, String>>[];
     String? ip, mac, vendor;
     for (final line in LineSplitter.split(raw)) {
@@ -1045,6 +1340,60 @@ echo "$stopM $stopH * * * nft delete element inet fw4 blocklist { $cleanMac } 2>
 
   Future<void> reboot() async {
     await runCommand('reboot');
+  }
+
+  /// Генерация SSH-ключей на роутере и установка публичного ключа
+  Future<Map<String, String>> generateAndInstallKey() async {
+    // 1. Генерируем ED25519 ключ (без пароля)
+    await runCommand('rm -f /tmp/id_ed25519 /tmp/id_ed25519.pub; ssh-keygen -t ed25519 -f /tmp/id_ed25519 -N "" 2>/dev/null');
+    // 2. Читаем приватный ключ
+    final privKey = await runCommand('cat /tmp/id_ed25519');
+    // 3. Читаем публичный ключ
+    final pubKey = await runCommand('cat /tmp/id_ed25519.pub');
+    // 4. Устанавливаем публичный ключ в authorized_keys
+    await runCommand('mkdir -p /etc/dropbear && cat /tmp/id_ed25519.pub >> /etc/dropbear/authorized_keys');
+    await runCommand('mkdir -p /root/.ssh 2>/dev/null; cat /tmp/id_ed25519.pub >> /root/.ssh/authorized_keys 2>/dev/null || true');
+    // 5. Удаляем временные файлы
+    await runCommand('rm -f /tmp/id_ed25519 /tmp/id_ed25519.pub');
+    return {'private': privKey, 'public': pubKey};
+  }
+
+  Future<String> syncTime() async {
+    // Пробуем несколько методов синхронизации времени
+    try {
+      // Метод 1: ntpd однократно
+      final r1 = await runCommand(
+        'ntpd -n -q -p 0.pool.ntp.org 2>&1 || ntpd -q -p 0.pool.ntp.org 2>&1 || echo FAIL'
+      ).timeout(const Duration(seconds: 15));
+      if (!r1.contains('FAIL') && !r1.contains('not found')) {
+        final curTime = await runCommand('date "+%Y-%m-%d %H:%M:%S"').then((s) => s.trim());
+        return 'Время синхронизировано: $curTime';
+      }
+    } catch (_) {}
+
+    try {
+      // Метод 2: sysntpd restart
+      final r2 = await runCommand(
+        '/etc/init.d/sysntpd restart 2>&1 || echo FAIL'
+      ).timeout(const Duration(seconds: 10));
+      if (!r2.contains('FAIL') && !r2.contains('not found')) {
+        await Future.delayed(const Duration(seconds: 2));
+        final curTime = await runCommand('date "+%Y-%m-%d %H:%M:%S"').then((s) => s.trim());
+        return 'Время синхронизировано: $curTime';
+      }
+    } catch (_) {}
+
+    try {
+      // Метод 3: установка времени через HTTP
+      final httpTime = await runCommand(
+        "date -s \"\$(wget -qO- -T 3 http://worldtimeapi.org/api/ip 2>/dev/null | grep -o '\\\"datetime\\\":\\\"[^\\\"]*' | cut -d'\"' -f4)\" 2>&1 || echo FAIL"
+      ).timeout(const Duration(seconds: 10));
+      if (!httpTime.contains('FAIL')) {
+        return 'Время установлено через HTTP';
+      }
+    } catch (_) {}
+
+    return 'Не удалось синхронизировать. Установите: opkg install ntpdate';
   }
 
   Future<void> wifiReload() async {
@@ -1343,10 +1692,33 @@ uci commit firewall
   Future<void> installPackages(List<String> packages) async {
     if (packages.isEmpty) return;
     final pkg = await detectPackageManager();
-    if (pkg == 'APK') {
-      await runCommand('apk update && apk add ${packages.join(' ')}');
-    } else {
-      await runCommand('opkg update && opkg install ${packages.join(' ')}');
+
+    // Метод 1: штатный менеджер пакетов
+    try {
+      if (pkg == 'APK') {
+        await runCommand('apk update && apk add ${packages.join(' ')}');
+      } else {
+        await runCommand('opkg update && opkg install ${packages.join(' ')}');
+      }
+      return;
+    } catch (e) {
+      // Метод 2 (fallback): opkg с force-depends
+      if (pkg != 'APK') {
+        try {
+          await runCommand('opkg update && opkg install --force-depends ${packages.join(' ')}');
+          return;
+        } catch (_) {}
+      }
+      // Метод 3 (fallback): установка по одному
+      for (final p in packages) {
+        try {
+          if (pkg == 'APK') {
+            await runCommand('apk add $p');
+          } else {
+            await runCommand('opkg install --force-depends $p');
+          }
+        } catch (_) {}
+      }
     }
   }
 
@@ -1357,6 +1729,10 @@ uci commit firewall
     'sstpc': ['sstp-client'],
     'strongswan': ['strongswan-default', 'strongswan-minimal'],
     'xl2tpd': ['xl2tpd'],
+    'iperf3': ['iperf3', 'iperf3-ssl'],
+    'macchanger': ['macchanger'],
+    'nlbwmon': ['nlbwmon'],
+    'pixiewps': ['pixiewps'],
   };
 
   Future<bool> isPackageInRepo(String name) async {
@@ -1385,6 +1761,8 @@ uci commit firewall
     'sstpc': 'sstp-client', 'strongswan': 'strongswan-default',
     'xl2tpd': 'xl2tpd', 'wol': 'wol', 'nmap': 'nmap',
     'wget/uclient': 'wget',
+    'iperf3': 'iperf3', 'macchanger': 'macchanger',
+    'nlbwmon': 'nlbwmon', 'pixiewps': 'pixiewps',
   };
 
   int _parseBytes(dynamic value) {
@@ -1395,88 +1773,199 @@ uci commit firewall
   }
 
   Future<List<ClientInfo>> fetchClientsWithTraffic() async {
-    final leases = await fetchClients();
-    final Map<String, Map<String, dynamic>> wifiStats = {};
+    final List<ClientInfo> result = [];
+    final Map<String, int> macToMonthRx = {};
+    final Map<String, int> macToMonthTx = {};
+    final Map<String, int> macToWifiRx = {};
+    final Map<String, int> macToWifiTx = {};
+    final Map<String, int> macToSignal = {};
+    final Map<String, String> macToBand = {};
+    final Map<String, String> macToIp = {};
+    final Map<String, String> macToHostname = {};
+    final Map<String, String> macToIface = {};
+    final Map<String, String> macToBitrateRx = {};
+    final Map<String, String> macToBitrateTx = {};
+    final Set<String> activeMacs = {};
+    final Set<String> wifiMacs = {};
+    final Set<String> wiredMacs = {};
+    final String routerIp = '192.168.1.1';
 
-    // Собираем статистику со всех hostapd интерфейсов
-    final macToAp = <String, String>{};
-    try {
-      final raw = await runCommand('ubus list | grep -E "^hostapd\\." || echo ""');
-      final ifaces = LineSplitter.split(raw).where((l) => l.isNotEmpty).toList();
-      for (final iface in ifaces) {
-        try {
-          final res = await runCommand('ubus call $iface get_clients');
-          final data = jsonDecode(res) as Map<String, dynamic>;
-          final clients = data['clients'] as Map<String, dynamic>? ?? {};
-          clients.forEach((mac, info) {
-            if (info is Map<String, dynamic>) {
-              final cleanMac = mac.toLowerCase();
-              wifiStats[cleanMac] = info;
-              macToAp[cleanMac] = iface;
-            }
-          });
-        } catch (_) {}
-      }
-    } catch (_) {}
+    // 1. Одним SSH-запросом получаем все данные
+    final raw = await runCommand("""
+route_iface=\$(ip route | grep '^default' | head -n1 | awk '{print \$5}');
+echo '===WAN_RX==='; cat /sys/class/net/\$route_iface/statistics/rx_bytes 2>/dev/null || echo 0;
+echo '===WAN_TX==='; cat /sys/class/net/\$route_iface/statistics/tx_bytes 2>/dev/null || echo 0;
+echo '===WIFI==='; for iface in \$(iw dev 2>/dev/null | grep Interface | awk '{print \$2}'); do
+  freq=\$(iw dev \$iface info 2>/dev/null | grep -oE '[0-9]+ MHz' | head -n1 | awk '{print \$1}');
+  [ -z "\$freq" ] && freq=0;
+  iw dev \$iface station dump | awk -v ifc="\$iface" -v f="\$freq" 'BEGIN{mac=""}
+    /^Station/ { if(mac!="") { if(rxb=="") rxb="-"; if(txb=="") txb="-"; print mac, rx, tx, ifc, f, rxb, txb }
+      mac=\$2; rx=0; tx=0; rxb=""; txb="" }
+    /rx bytes:/ { rx=\$3 } /tx bytes:/ { tx=\$3 }
+    /rx bitrate:/ { rxb=\$3" "\$4 } /tx bitrate:/ { txb=\$3" "\$4 }
+    /signal:/ { sig=\$2 } /signal avg:/ { sig=\$2 }
+    END { if(mac!="") { if(rxb=="") rxb="-"; if(txb=="") txb="-"; print mac, rx, tx, ifc, f, rxb, txb } }';
+done;
+echo '===LEASES==='; cat /tmp/dhcp.leases 2>/dev/null;
+echo '===ARP==='; cat /proc/net/arp 2>/dev/null;
+echo '===FDB==='; bridge fdb show br-lan 2>/dev/null | grep dev | grep -v 'self' 2>/dev/null;
+echo '===DSA==='; for lan in \$(ls /sys/class/net/ 2>/dev/null | grep -E '^lan[0-9]+\$'); do
+  carrier=\$(cat /sys/class/net/\$lan/carrier 2>/dev/null || echo 0);
+  rx=\$(cat /sys/class/net/\$lan/statistics/rx_bytes 2>/dev/null || echo 0);
+  tx=\$(cat /sys/class/net/\$lan/statistics/tx_bytes 2>/dev/null || echo 0);
+  echo "\$lan \$carrier \$rx \$tx";
+done;
+echo '===NLBW==='; if command -v nlbw >/dev/null; then nlbw -c csv -g mac,date 2>/dev/null | grep -E "(mac|\$(date +%F))"; fi;
+echo '===DONE==='
+""").timeout(const Duration(seconds: 15));
 
-    // Fallback: пробуем iw station dump для всех беспроводных интерфейсов
-    try {
-      final raw = await runCommand('iwinfo 2>/dev/null | grep -E "^[a-z].*ESSID\|^[a-z].*Mode" || echo ""');
-      final ifaces = <String>[];
-      for (final line in LineSplitter.split(raw)) {
-        final m = RegExp(r'^(\S+)').firstMatch(line);
-        if (m != null && !ifaces.contains(m.group(1)!)) ifaces.add(m.group(1)!);
+    // 2. Парсим секции
+    String _extractSection(String raw, String marker) {
+      final start = '===$marker===';
+      final startIdx = raw.indexOf(start);
+      if (startIdx < 0) return '';
+      int contentStart = startIdx + start.length;
+      if (contentStart < raw.length && raw[contentStart] == '\n') contentStart++;
+      final nextMarker = raw.indexOf('\n===', contentStart);
+      if (nextMarker < 0) return raw.substring(contentStart).trim();
+      return raw.substring(contentStart, nextMarker).trim();
+    }
+
+    final wifiSection = _extractSection(raw, 'WIFI');
+    final leasesSection = _extractSection(raw, 'LEASES');
+    final arpSection = _extractSection(raw, 'ARP');
+    final fdbSection = _extractSection(raw, 'FDB');
+    final nlbwSection = _extractSection(raw, 'NLBW');
+
+    // 3. DHCP Leases
+    for (final line in LineSplitter.split(leasesSection)) {
+      final parts = line.trim().split(RegExp(r'\s+'));
+      if (parts.length >= 4) {
+        final mac = parts[1].toLowerCase();
+        activeMacs.add(mac);
+        macToIp[mac] = parts[2];
+        macToHostname[mac] = parts[3] != '*' ? parts[3] : 'Unknown';
       }
-      // Если iwinfo не работает, пробуем iw dev
-      if (ifaces.isEmpty) {
-        final raw2 = await runCommand('iw dev 2>/dev/null | grep Interface | awk "{print \$2}" || echo ""');
-        ifaces.addAll(LineSplitter.split(raw2).where((l) => l.isNotEmpty).toList());
-      }
-      for (final iface in ifaces) {
-          try {
-            final res = await runCommand('iw dev $iface station dump 2>/dev/null || echo ""');
-            String? currentMac;
-            for (final line in LineSplitter.split(res)) {
-              final trimmed = line.trim();
-              if (trimmed.startsWith('Station')) {
-                currentMac = trimmed.split(' ')[1].toLowerCase();
-              }
-              if (currentMac != null) {
-                if (trimmed.contains('rx bytes:') || trimmed.contains('tx bytes:')) {
-                  final parts = trimmed.split(':');
-                  final key = trimmed.contains('rx') ? 'bytes_received' : 'bytes_sent';
-                  final val = int.tryParse(parts.last.trim()) ?? 0;
-                  wifiStats.putIfAbsent(currentMac, () => {});
-                  wifiStats[currentMac]![key] = val;
-                }
-                if (trimmed.contains('signal:')) {
-                  wifiStats.putIfAbsent(currentMac, () => {});
-                  wifiStats[currentMac]!['signal'] = int.tryParse(trimmed.split(':').last.trim().replaceAll('dBm', '').trim());
-                }
-                macToAp.putIfAbsent(currentMac, () => iface);
-              }
-            }
-          } catch (_) {}
+    }
+
+    // 4. ARP
+    for (final line in LineSplitter.split(arpSection)) {
+      final parts = line.trim().split(RegExp(r'\s+'));
+      if (parts.length >= 4 && parts[3] != '00:00:00:00:00:00') {
+        final mac = parts[3].toLowerCase();
+        if (!activeMacs.contains(mac)) {
+          activeMacs.add(mac);
+          macToHostname[mac] = 'Unknown';
         }
-      } catch (_) {}
+        if (parts[2] != '0x0') {
+          macToIp[mac] = parts[0];
+        }
+        macToIface[mac] = parts.last;
+      }
+    }
 
-    return leases.map((client) {
-      final cleanMac = client.mac.toLowerCase();
-      final info = wifiStats[cleanMac];
-      return ClientInfo(
-        hostname: client.hostname,
-        mac: client.mac,
-        ip: client.ip,
-        interface: client.interface,
-        leaseExpiry: client.leaseExpiry,
-        active: client.active,
-        rxBytes: _parseBytes(info?['bytes_received']),
-        txBytes: _parseBytes(info?['bytes_sent']),
-        signal: info?['signal'] is int ? info!['signal'] as int : null,
-        connectionType: info != null ? 'Wi-Fi' : 'LAN',
-        accessPoint: macToAp[cleanMac]?.replaceFirst('hostapd.', ''),
-      );
-    }).toList();
+    // 5. WiFi station dump
+    for (final line in LineSplitter.split(wifiSection)) {
+      final parts = line.trim().split(RegExp(r'\s+'));
+      if (parts.length >= 4) {
+        final mac = parts[0].toLowerCase();
+        final rx = int.tryParse(parts[1]) ?? 0;
+        final tx = int.tryParse(parts[2]) ?? 0;
+        final iface = parts[3];
+        final freq = int.tryParse(parts.length > 4 ? parts[4] : '0') ?? 0;
+        final rxBitrate = parts.length >= 7 ? '${parts[5]} ${parts[6]}' : null;
+        final txBitrate = parts.length >= 9 ? '${parts[7]} ${parts[8]}' : null;
+
+        String band = 'Wi-Fi ($iface)';
+        if (freq >= 2400 && freq <= 2500) band = 'Wi-Fi 2.4GHz';
+        else if (freq >= 5000 && freq <= 5900) band = 'Wi-Fi 5GHz';
+        else if (freq >= 5900 && freq <= 7200) band = 'Wi-Fi 6GHz';
+
+        macToWifiRx[mac] = rx;
+        macToWifiTx[mac] = tx;
+        macToBand[mac] = band;
+        macToIface[mac] = iface;
+        if (rxBitrate != null) macToBitrateRx[mac] = rxBitrate;
+        if (txBitrate != null) macToBitrateTx[mac] = txBitrate;
+        wifiMacs.add(mac);
+        activeMacs.add(mac);
+      }
+    }
+
+    // 6. Bridge FDB — проводные клиенты
+    for (final line in LineSplitter.split(fdbSection)) {
+      final parts = line.trim().split(RegExp(r'\s+'));
+      if (parts.length >= 3 && parts[1] == 'dev') {
+        final mac = parts[0].toLowerCase();
+        final dev = parts[2];
+        final isWifiDev = dev.startsWith('phy') || dev.startsWith('wlan') ||
+            dev.startsWith('ath') || dev.startsWith('ra') || dev.startsWith('rai') || dev.contains('ap');
+        if (!isWifiDev && !parts.contains('permanent') && !parts.contains('self')) {
+          wiredMacs.add(mac);
+          macToIface[mac] = dev;
+        }
+      }
+    }
+
+    // 7. NLBW — месячный трафик
+    int rxIdx = -1, txIdx = -1, macIdx = 0;
+    for (final (idx, line) in LineSplitter.split(nlbwSection).indexed) {
+      final parts = line.trim().split(',');
+      if (idx == 0 && (line.contains('rx_bytes') || line.contains('rx'))) {
+        for (int i = 0; i < parts.length; i++) {
+          final p = parts[i].replaceAll('"', '').toLowerCase();
+          if (p.contains('rx')) rxIdx = i;
+          if (p.contains('tx')) txIdx = i;
+          if (p.contains('mac')) macIdx = i;
+        }
+        continue;
+      }
+      if (rxIdx == -1) {
+        if (parts.length >= 6) { macIdx = 0; rxIdx = 3; txIdx = 4; }
+        else if (parts.length >= 4) { macIdx = 0; rxIdx = 2; txIdx = 3; }
+      }
+      if (parts.length > [rxIdx, txIdx, macIdx].reduce((a, b) => a > b ? a : b) && rxIdx != -1) {
+        final mac = parts[macIdx].replaceAll('"', '').toLowerCase();
+        macToMonthRx[mac] = int.tryParse(parts[rxIdx].replaceAll('"', '')) ?? 0;
+        macToMonthTx[mac] = int.tryParse(parts[txIdx].replaceAll('"', '')) ?? 0;
+      }
+    }
+
+    // 8. Собираем результат
+    for (final mac in activeMacs) {
+      final ip = macToIp[mac];
+      if (ip == routerIp || ip == '127.0.0.1') continue;
+      final isWifi = wifiMacs.contains(mac);
+      final isWired = wiredMacs.contains(mac);
+      String connectionType;
+      String? accessPoint;
+      if (isWifi) {
+        connectionType = macToBand[mac] ?? 'Wi-Fi';
+        accessPoint = macToIface[mac];
+      } else if (isWired) {
+        connectionType = 'LAN';
+        accessPoint = macToIface[mac];
+      } else {
+        connectionType = 'LAN';
+      }
+
+      result.add(ClientInfo(
+        hostname: macToHostname[mac] ?? 'Unknown',
+        mac: mac,
+        ip: ip,
+        active: true,
+        rxBytes: macToWifiRx[mac] ?? 0,
+        txBytes: macToWifiTx[mac] ?? 0,
+        monthRxBytes: macToMonthRx[mac] ?? 0,
+        monthTxBytes: macToMonthTx[mac] ?? 0,
+        connectionType: connectionType,
+        accessPoint: accessPoint,
+        rxBitrate: macToBitrateRx[mac],
+        txBitrate: macToBitrateTx[mac],
+      ));
+    }
+
+    return result;
   }
 
   Future<List<String>> fetchBlockedMacs() async {

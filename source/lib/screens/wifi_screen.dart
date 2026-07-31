@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
 import '../models/wifi_info.dart';
 import '../services/openwrt_service.dart';
+import '../services/local_wifi_scanner.dart';
+import '../models/channel_scan_result.dart';
+import 'channel_analyzer_screen.dart';
+import '../widgets/safe_command_dialog.dart';
 
 class WifiScreen extends StatefulWidget {
   final OpenWrtService service;
@@ -441,7 +445,18 @@ class _WifiScreenState extends State<WifiScreen> {
   Future<void> _aiOptimize(WifiDevice dev) async {
     setState(() => processing['ai_${dev.name}'] = true);
     try {
-      final result = await widget.service.aiOptimizeWifi(dev.name);
+      // Собираем данные с телефона для анализа
+      List<ChannelScanResult>? phoneScans;
+      try {
+        final scanResult = await LocalWifiScanner.scan();
+        if (scanResult.success && scanResult.results.isNotEmpty) {
+          phoneScans = scanResult.results
+              .where((s) => LocalWifiScanner.bandForChannel(s.channel) == (dev.band ?? '2.4g'))
+              .toList();
+        }
+      } catch (_) {}
+
+      final result = await widget.service.aiOptimizeWifi(dev.name, phoneScans: phoneScans);
       if (!mounted) return;
       setState(() => processing.remove('ai_${dev.name}'));
 
@@ -608,6 +623,25 @@ class _WifiScreenState extends State<WifiScreen> {
                                         onPressed: processing.containsKey('auto_${d.name}') ? null : () => _autoChannel(d),
                                         icon: const Icon(Icons.auto_fix_high),
                                         label: const Text('Авто'),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 4),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: FilledButton.tonalIcon(
+                                        onPressed: () => Navigator.of(context).push(
+                                          MaterialPageRoute(
+                                            builder: (_) => ChannelAnalyzerScreen(
+                                              service: widget.service,
+                                              deviceName: d.name,
+                                            ),
+                                          ),
+                                        ),
+                                        icon: const Icon(Icons.analytics, size: 18),
+                                        label: const Text('Анализатор каналов', style: TextStyle(fontSize: 13)),
                                       ),
                                     ),
                                   ],

@@ -12,6 +12,9 @@ import 'packages_screen.dart';
 import 'system_screen.dart';
 import 'wifi_screen.dart';
 import 'login_screen.dart';
+import 'terminal_screen.dart';
+import 'mac_changer_screen.dart';
+import 'wps_audit_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   final RouterConnection config;
@@ -281,6 +284,33 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 onTap: () {
                   Navigator.pop(context);
                   _switchRouter();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.terminal),
+                title: const Text('Терминал (Beta)'),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => TerminalScreen(service: service)));
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.swap_horiz),
+                title: const Text('MAC Changer'),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => MacChangerScreen(service: service)));
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.wifi_lock),
+                title: const Text('WPS Audit'),
+                onTap: () {
+                  Navigator.pop(context);
+                  Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => WpsAuditScreen(service: service)));
                 },
               ),
               ListTile(

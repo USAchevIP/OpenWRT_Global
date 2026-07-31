@@ -66,11 +66,18 @@ class ClientsScreenState extends State<ClientsScreen> {
 
   Map<String, List<ClientInfo>> get _byInterface {
     final map = <String, List<ClientInfo>>{};
+    // Сортировка: WiFi 2.4, WiFi 5, LAN
+    final order = ['Wi-Fi 2.4GHz', 'Wi-Fi 5GHz', 'Wi-Fi 6GHz', 'LAN'];
+    for (final label in order) {
+      final clients = allClients.where((c) => c.connectionType == label).toList();
+      if (clients.isNotEmpty) map[label] = clients;
+    }
+    // Остальные
     for (final c in allClients) {
-      final key = c.connectionType == 'Wi-Fi'
-          ? (c.accessPoint ?? 'Wi-Fi')
-          : 'LAN (провод)';
-      map.putIfAbsent(key, () => []).add(c);
+      if (!order.contains(c.connectionType)) {
+        final key = c.connectionType ?? 'Другое';
+        map.putIfAbsent(key, () => []).add(c);
+      }
     }
     return map;
   }
@@ -289,9 +296,15 @@ class ClientsScreenState extends State<ClientsScreen> {
           sliver: SliverToBoxAdapter(
             child: Row(children: [
               Icon(
-                name.contains('Wi-Fi') ? Icons.wifi : Icons.settings_ethernet,
+                name.contains('5GHz') ? Icons.wifi : 
+                name.contains('2.4GHz') ? Icons.wifi : 
+                name.contains('6GHz') ? Icons.signal_cellular_alt : 
+                Icons.settings_ethernet,
                 size: 20,
-                color: t.colorScheme.primary,
+                color: name.contains('5GHz') ? const Color(0xFF0077CC) :
+                       name.contains('2.4GHz') ? const Color(0xFF2E7D32) :
+                       name.contains('6GHz') ? const Color(0xFF9C27B0) :
+                       t.colorScheme.primary,
               ),
               const SizedBox(width: 8),
               Text(name,
@@ -426,6 +439,10 @@ class ClientsScreenState extends State<ClientsScreen> {
     final blocked = blockedMacs.contains(c.mac);
     final limit = limits[c.mac];
     final progress = _progress(c);
+    final bandColor = c.connectionType?.contains('6GHz') == true ? const Color(0xFF9C27B0) :
+                      c.connectionType?.contains('5GHz') == true ? const Color(0xFF0077CC) :
+                      c.connectionType?.contains('2.4GHz') == true ? const Color(0xFF2E7D32) :
+                      const Color(0xFF6D4C41);
     return GestureDetector(
       onTap: () => Navigator.of(context).push(
         MaterialPageRoute(
@@ -438,11 +455,11 @@ class ClientsScreenState extends State<ClientsScreen> {
           leading: CircleAvatar(
             radius: 22,
             backgroundColor:
-                blocked ? Colors.red.withValues(alpha: 0.15) : t.colorScheme.primaryContainer,
+                blocked ? Colors.red.withValues(alpha: 0.15) : bandColor.withValues(alpha: 0.15),
             child: Icon(
               blocked ? Icons.block : _typeIcon(_deviceType(c)),
               size: 20,
-              color: blocked ? Colors.red : t.colorScheme.onPrimaryContainer,
+              color: blocked ? Colors.red : bandColor,
             ),
           ),
           onExpansionChanged: (expanded) {
@@ -451,10 +468,44 @@ class ClientsScreenState extends State<ClientsScreen> {
               _classify(c);
             }
           },
-          title: Text(_displayName(c),
-              style: t.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600)),
+          title: Row(
+            children: [
+              Expanded(child: Text(_displayName(c),
+                  style: t.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600))),
+              if (c.isWifi) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: bandColor.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    c.connectionType?.contains('5GHz') == true ? '5G' :
+                    c.connectionType?.contains('6GHz') == true ? '6G' : '2.4G',
+                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: bandColor),
+                  ),
+                ),
+                const SizedBox(width: 6),
+              ],
+              if (c.dlSpeed != null && c.dlSpeed! > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: c.dlSpeed! > 10 ? Colors.green.withValues(alpha: 0.15) : Colors.orange.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    '${c.dlSpeed!.toStringAsFixed(1)} Мбит/с',
+                    style: TextStyle(
+                      fontSize: 10, fontWeight: FontWeight.bold,
+                      color: c.dlSpeed! > 10 ? Colors.green.shade700 : Colors.orange.shade700,
+                    ),
+                  ),
+                ),
+            ],
+          ),
           subtitle: Text(
-              '${c.ip ?? '-'} • ${c.mac}${_vendor(c).isNotEmpty ? ' (${_vendor(c)})' : ''} • ${c.totalHuman}'),
+              '${c.ip ?? '-'} • ${c.mac}${_vendor(c).isNotEmpty ? ' (${_vendor(c)})' : ''}'),
           children: [
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
@@ -468,13 +519,23 @@ class ClientsScreenState extends State<ClientsScreen> {
                         avatar: Icon(_typeIcon(_deviceType(c)), size: 16),
                         label: Text(_deviceType(c)!, style: const TextStyle(fontSize: 12)),
                         visualDensity: VisualDensity.compact,
-                        backgroundColor: t.colorScheme.primary.withValues(alpha: 0.08),
+                        backgroundColor: bandColor.withValues(alpha: 0.08),
                       ),
                     ),
+                  _r(t, 'Тип', c.connectionType ?? '—'),
                   _r(t, 'Точка доступа', c.accessPoint ?? c.interface ?? '—'),
-                  _r(t, 'Сигнал', c.signal != null ? '${c.signal} dBm' : '—'),
+                  if (c.rxBitrate != null) _r(t, 'Битрейт (RX)', c.rxBitrate!),
+                  if (c.txBitrate != null) _r(t, 'Битрейт (TX)', c.txBitrate!),
+                  if (c.dlSpeed != null && c.dlSpeed! > 0) _r(t, '↓ Скорость', c.dlSpeedHuman),
+                  if (c.ulSpeed != null && c.ulSpeed! > 0) _r(t, '↑ Скорость', c.ulSpeedHuman),
                   _r(t, '↓ Получено', c.rxHuman),
                   _r(t, '↑ Отправлено', c.txHuman),
+                  if (c.monthTotalBytes > 0) ...[
+                    const Divider(height: 16),
+                    _r(t, 'Трафик за месяц', c.monthTotalHuman),
+                    _r(t, '↓ Месяц', c.monthRxHuman),
+                    _r(t, '↑ Месяц', c.monthTxHuman),
+                  ],
                   if (limit != null && limit > 0) ...[
                     const SizedBox(height: 6),
                     LinearProgressIndicator(

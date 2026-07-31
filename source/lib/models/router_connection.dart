@@ -4,6 +4,8 @@ class RouterConnection {
   final int port;
   final String username;
   final String password;
+  final String? sshKey;
+  final bool useKey;
   final bool useHttps;
 
   RouterConnection({
@@ -11,7 +13,9 @@ class RouterConnection {
     required this.host,
     this.port = 22,
     this.username = 'root',
-    required this.password,
+    this.password = '',
+    this.sshKey,
+    this.useKey = false,
     this.useHttps = false,
   });
 
@@ -21,6 +25,8 @@ class RouterConnection {
         'port': port,
         'username': username,
         'password': password,
+        'sshKey': sshKey,
+        'useKey': useKey,
         'useHttps': useHttps,
       };
 
@@ -30,6 +36,8 @@ class RouterConnection {
         port: json['port'] ?? 22,
         username: json['username'] ?? 'root',
         password: json['password'] ?? '',
+        sshKey: json['sshKey']?.toString(),
+        useKey: json['useKey'] == true,
         useHttps: json['useHttps'] ?? false,
       );
 }

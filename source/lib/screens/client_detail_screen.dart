@@ -23,8 +23,8 @@ class _ClientDetailScreenState extends State<ClientDetailScreen> {
     final c = widget.client;
     try {
       // Тип из локальных данных
-      deviceType = c.connectionType == 'Wi-Fi' ? 'Wi-Fi устройство' : 'Проводное устройство';
-      apInfo = c.accessPoint ?? c.interface ?? (c.connectionType == 'Wi-Fi' ? 'Wi-Fi' : 'LAN');
+      deviceType = c.connectionType?.contains('Wi-Fi') == true ? 'Wi-Fi устройство' : 'Проводное устройство';
+      apInfo = c.accessPoint ?? c.interface ?? (c.connectionType?.contains('Wi-Fi') == true ? 'Wi-Fi' : 'LAN');
 
       // Пробуем получить вендор с роутера (быстро, без интернета)
       try {

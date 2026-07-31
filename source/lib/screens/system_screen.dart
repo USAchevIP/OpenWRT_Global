@@ -61,6 +61,61 @@ class _SystemScreenState extends State<SystemScreen> {
     }
   }
 
+  Future<void> _syncTime() async {
+    _showProgress('Синхронизация времени...');
+    try {
+      final result = await widget.service.syncTime();
+      if (!mounted) return;
+      Navigator.pop(context);
+      _snack(result);
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.pop(context);
+      _snack('Ошибка: $e');
+    }
+  }
+
+  Future<void> _generateSshKey() async {
+    _showProgress('Генерация SSH-ключа...');
+    try {
+      final keys = await widget.service.generateAndInstallKey();
+      if (!mounted) return;
+      Navigator.pop(context);
+      final priv = keys['private'] ?? '';
+      await showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Row(children: [Icon(Icons.vpn_key, color: Colors.green), SizedBox(width: 8), Text('SSH-ключ создан')]),
+          content: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Приватный ключ (сохраните его):', style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: SelectableText(priv, style: const TextStyle(fontFamily: 'monospace', fontSize: 10)),
+              ),
+              const SizedBox(height: 12),
+              const Text('Теперь вы можете войти по ключу, скопируйте приватный ключ и добавьте роутер с типом "SSH-ключ".'),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+          ],
+        ),
+      );
+      _snack('SSH-ключ установлен на роутер');
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.pop(context);
+      _snack('Ошибка: $e');
+    }
+  }
+
   Future<void> _serviceAction(String name) async {
     final ok = await _confirm('Перезапустить $name?', 'Служба будет перезапущена.');
     if (ok != true) return;
@@ -811,6 +866,10 @@ class _SystemScreenState extends State<SystemScreen> {
                     _ActionCard(icon: Icons.public, title: 'Удалённый доступ', subtitle: 'SSH снаружи — безопасный порт', onTap: _remoteAccessDialog),
                     const SizedBox(height: 12),
                     _ActionCard(icon: Icons.power_settings_new, title: 'Перезагрузить', subtitle: 'reboot', color: theme.colorScheme.error, onTap: _reboot),
+                    const SizedBox(height: 12),
+                    _ActionCard(icon: Icons.access_time, title: 'Синхронизация времени', subtitle: 'NTP / sysntpd / date', onTap: _syncTime),
+                    const SizedBox(height: 12),
+                    _ActionCard(icon: Icons.vpn_key, title: 'Создать SSH-ключ', subtitle: 'Генерация ED25519 для входа без пароля', onTap: _generateSshKey),
                     const SizedBox(height: 12),
                     _ActionCard(icon: Icons.router, title: 'Проброс портов', subtitle: 'Firewall redirects', onTap: _showPortForwards),
                     const SizedBox(height: 12),
