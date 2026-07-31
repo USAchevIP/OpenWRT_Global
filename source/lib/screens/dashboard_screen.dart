@@ -175,18 +175,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
   ]);
 
   Widget _miniWidget(ThemeData t, IconData icon, String label, String value, Color color, {String? sub, String? ip}) => Expanded(
-    child: Card(child: Padding(padding: const EdgeInsets.all(10), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    child: Card(child: Padding(padding: const EdgeInsets.all(8), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Row(children: [
-        Icon(icon, size: 18, color: color),
-        const SizedBox(width: 6),
-        Text(label, style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant, fontSize: 11)),
+        Icon(icon, size: 16, color: color),
+        const SizedBox(width: 4),
+        Text(label, style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant, fontSize: 10)),
       ]),
-      const SizedBox(height: 4),
+      const SizedBox(height: 2),
       if (ip != null && ip.isNotEmpty)
-        SelectableText(ip, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, fontFamily: 'monospace', color: color), maxLines: 1),
+        SelectableText(ip, style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700, fontFamily: 'monospace', color: color), maxLines: 1),
       if ((ip == null || ip.isEmpty) && value.isNotEmpty)
-        Text(value, style: t.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w700, fontSize: 12), maxLines: 2, overflow: TextOverflow.ellipsis),
-      if (sub != null) Text(sub, style: TextStyle(fontSize: 10, color: t.colorScheme.onSurfaceVariant)),
+        Text(value, style: t.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w700, fontSize: 11), maxLines: 2, overflow: TextOverflow.ellipsis),
+      if (sub != null) Text(sub, style: TextStyle(fontSize: 9, color: t.colorScheme.onSurfaceVariant)),
     ]))),
   );
 
