@@ -15,19 +15,31 @@ class ChannelAnalyzer {
     // Роутер: детальное сканирование
     List<ChannelScanResult> routerScans = [];
     Map<int, int> routerInterference = {};
+    String routerError = '';
     try {
       routerScans = await routerService.scanWifiChannelsDetailed(deviceName);
       routerInterference = await routerService.scanWifiChannels(deviceName);
-    } catch (_) {}
+    } catch (e) {
+      routerError = e.toString();
+    }
 
     // Телефон: сканирование через WiFi
     List<ChannelScanResult> phoneScans = [];
+    String phoneMessage = '';
     try {
       final scanResult = await LocalWifiScanner.scan();
-      phoneScans = scanResult.results
-          .where((s) => LocalWifiScanner.bandForChannel(s.channel) == band)
-          .toList();
-    } catch (_) {}
+      phoneMessage = scanResult.message;
+      if (scanResult.success) {
+        phoneScans = scanResult.results
+            .where((s) => LocalWifiScanner.bandForChannel(s.channel) == band)
+            .toList();
+        if (phoneScans.isEmpty && scanResult.results.isNotEmpty) {
+          phoneMessage = 'Найдены сети, но не в диапазоне $band';
+        }
+      }
+    } catch (e) {
+      phoneMessage = 'Ошибка: $e';
+    }
 
     // Рекомендации
     final recommended = _findBestChannels(
@@ -51,9 +63,14 @@ class ChannelAnalyzer {
 
   Future<String> _getBand(String device) async {
     try {
-      return (await routerService
-              .runCommand('uci get wireless.$device.band 2>/dev/null || echo "2.4g"'))
-          .trim();
+      final raw = await routerService
+          .runCommand('uci get wireless.$device.band 2>/dev/null || echo "2.4g"');
+      final band = raw.trim().toLowerCase();
+      // OpenWrt может возвращать 'bg', 'g', '2.4g' — нормализуем
+      if (band == 'bg' || band == 'g' || band == '2.4g' || band == '2.4') return '2.4g';
+      if (band == 'a' || band == '5g' || band == '5') return '5g';
+      if (band == '6g' || band == '6') return '6g';
+      return '2.4g';
     } catch (_) {
       return '2.4g';
     }
@@ -105,7 +122,6 @@ class ChannelAnalyzer {
       ..sort((a, b) => a.value.compareTo(b.value));
 
     if (band == '5g') {
-      // Для 5 ГГц предпочитаем каналы, которые подходят под ширину
       return sorted.where((e) {
         if (preferredWidth >= 80) return e.key % 8 == 4 || e.key % 8 == 0;
         if (preferredWidth >= 40) return e.key % 4 == 0;

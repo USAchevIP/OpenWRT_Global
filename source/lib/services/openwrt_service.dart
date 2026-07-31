@@ -247,7 +247,33 @@ class OpenWrtService {
   }
 
   Future<List<ChannelScanResult>> scanWifiChannelsDetailed(String device) async {
-    final raw = await runCommand('iwinfo $device scan 2>/dev/null || iw dev $device scan 2>/dev/null || echo ""');
+    // iwinfo не показывает ширину канала, используем только iw dev
+    // Сначала ищем реальный wifi-интерфейс вместо radio
+    String iface = device;
+    try {
+      final raw = await runCommand(
+          'uci show wireless 2>/dev/null | grep device=\'$device\' | head -1 | cut -d. -f2 || echo ""');
+      final section = raw.trim();
+      if (section.isNotEmpty) {
+        final i = (await runCommand('uci get wireless.$section.ifname 2>/dev/null || echo ""')).trim();
+        if (i.isNotEmpty) iface = i;
+      }
+    } catch (_) {}
+    // Если не нашли через uci, пробуем iw dev
+    if (iface == device) {
+      try {
+        final raw = await runCommand('iw dev 2>/dev/null | grep Interface | awk \'{print \$2}\'');
+        final phyNum = device.replaceAll(RegExp(r'[^0-9]'), '');
+        for (final line in raw.split('\n')) {
+          final name = line.trim();
+          if (name.isEmpty) continue;
+          final phy = (await runCommand('iw dev $name info 2>/dev/null | grep wiphy || echo ""')).trim();
+          if (phy.contains('wiphy $phyNum')) { iface = name; break; }
+        }
+      } catch (_) {}
+    }
+
+    final raw = await runCommand('iw dev $iface scan 2>/dev/null || echo ""');
     final results = <ChannelScanResult>[];
     String? currentSsid, currentBssid, currentSig, currentCh;
     int currentWidth = 20;
