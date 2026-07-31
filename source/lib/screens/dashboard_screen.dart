@@ -18,9 +18,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
   bool loading = true;
   String? error;
   String publicIp = '';
+  String vpnIp = '';
   int totalClients = 0, wifiClients = 0, lanClients = 0;
   String vpnStatus = '—';
   bool internetOk = false;
+  String dnsServers = '—';
+  String wifi24Name = '—', wifi5Name = '—';
+  String interferenceLevel = '—';
+  Color interferenceColor = Colors.grey;
   final List<FlSpot> _cpu = [], _mem = [];
   int _tick = 0;
   Timer? _timer;
@@ -36,7 +41,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
       final d = await widget.service.fetchSystemInfo();
       _update(d);
 
-      // Статусы
       int w = 0, l = 0;
       try {
         final clients = await widget.service.fetchClientsWithTraffic();
@@ -46,23 +50,59 @@ class _DashboardScreenState extends State<DashboardScreen> {
       } catch (_) {}
 
       bool inet = false;
+      String wanIp = '', vpnIpStr = '';
       try {
         final ip = await widget.service.fetchPublicIp();
         inet = ip.isNotEmpty && !ip.contains('недоступно');
-        if (mounted) publicIp = ip.trim();
+        if (inet) wanIp = ip.trim();
       } catch (_) {}
-
-      String vpn = '—';
+      // Если VPN активен, получаем IP через VPN
       try {
         final vpns = await widget.service.fetchVpnStatus();
         final active = vpns.where((v) => v.up).toList();
-        if (active.isNotEmpty) vpn = active.map((v) => v.name).join(', ');
+        if (active.isNotEmpty) {
+          vpnStatus = active.map((v) => v.name).join(', ');
+          if (inet) { vpnIpStr = wanIp; wanIp = ''; }
+        }
+      } catch (_) {}
+
+      // DNS
+      try {
+        final dnsRaw = await widget.service.fetchDnsSettings();
+        final servers = <String>[];
+        final re = RegExp(r"server='([^']+)'");
+        for (final m in re.allMatches(dnsRaw)) { servers.add(m.group(1)!); }
+        dnsServers = servers.isNotEmpty ? servers.take(2).join('\n') : '—';
+      } catch (_) {}
+
+      // WiFi SSID
+      try {
+        final nets = await widget.service.fetchWifiNetworks();
+        for (final n in nets) {
+          final dev = n.device;
+          if (dev == 'radio0' && wifi24Name == '—') wifi24Name = n.ssid;
+          if (dev == 'radio1' && wifi5Name == '—') wifi5Name = n.ssid;
+        }
+      } catch (_) {}
+
+      // Помехи
+      try {
+        final devs = await widget.service.fetchWirelessDevices();
+        if (devs.isNotEmpty) {
+          final scan = await widget.service.scanWifiChannels(devs.first.name);
+          final maxCount = scan.values.isEmpty ? 0 : scan.values.reduce((a, b) => a > b ? a : b);
+          if (maxCount == 0) { interferenceLevel = 'Чисто'; interferenceColor = Colors.green; }
+          else if (maxCount <= 3) { interferenceLevel = 'Слабые'; interferenceColor = Colors.orange; }
+          else if (maxCount <= 6) { interferenceLevel = 'Средние'; interferenceColor = Colors.deepOrange; }
+          else { interferenceLevel = 'Сильные'; interferenceColor = Colors.red; }
+        }
       } catch (_) {}
 
       if (!mounted) return;
       setState(() {
         info = d; totalClients = w + l; wifiClients = w; lanClients = l;
-        internetOk = inet; vpnStatus = vpn; loading = false; error = null;
+        internetOk = inet; publicIp = wanIp; vpnIp = vpnIpStr;
+        loading = false; error = null;
       });
     } catch (e) { if (mounted) setState(() { error = e.toString(); loading = false; }); }
   }
@@ -90,7 +130,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       else if (error != null) _err(t)
       else if (info != null) SliverPadding(padding: const EdgeInsets.symmetric(horizontal: 16), sliver: SliverList(delegate: SliverChildListDelegate([
         _header(t), const SizedBox(height: 12),
-        _statusRow(t), const SizedBox(height: 12),
+        _statusRow(t), const SizedBox(height: 8),
+        _statusRow2(t), const SizedBox(height: 16),
         Row(children: [Expanded(child: _stat(t, Icons.memory, 'CPU', '${(info!.cpuLoad*100).toStringAsFixed(1)}%', t.colorScheme.primary)), const SizedBox(width: 12), Expanded(child: _stat(t, Icons.storage, 'RAM', _h(info!.memoryUsed), t.colorScheme.tertiary, sub: 'из ${_h(info!.memoryTotal)}'))]),
         const SizedBox(height: 16),
         _chart(t, 'Загрузка CPU (%)', _cpu, t.colorScheme.primary),
@@ -118,24 +159,34 @@ class _DashboardScreenState extends State<DashboardScreen> {
   ));
 
   Widget _statusRow(ThemeData t) => Row(children: [
-    _miniWidget(t, Icons.language, internetOk ? 'Интернет' : 'Нет сети', internetOk ? 'есть' : publicIp.isEmpty ? '—' : publicIp, internetOk ? Colors.green : Colors.red),
+    _miniWidget(t, Icons.language, 'Интернет', internetOk ? 'Есть' : 'Нет', internetOk ? Colors.green : Colors.red, ip: internetOk ? publicIp : ''),
     const SizedBox(width: 8),
-    _miniWidget(t, Icons.vpn_key, 'VPN', vpnStatus, vpnStatus != '—' ? t.colorScheme.secondary : t.colorScheme.outline),
+    _miniWidget(t, Icons.vpn_key, 'VPN', vpnStatus, vpnStatus != '—' ? t.colorScheme.secondary : t.colorScheme.outline, ip: vpnIp),
     const SizedBox(width: 8),
     _miniWidget(t, Icons.devices, 'Клиенты', '$totalClients', t.colorScheme.primary, sub: 'WiFi:$wifiClients LAN:$lanClients'),
   ]);
 
-  Widget _miniWidget(ThemeData t, IconData icon, String label, String value, Color color, {String? sub}) => Expanded(
-    child: Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Icon(icon, size: 22, color: color), const SizedBox(height: 8),
-      Text(label, style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant)),
-      Text(value, style: t.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w700, fontSize: 13), maxLines: 1, overflow: TextOverflow.ellipsis),
-      if (sub != null) Text(sub, style: t.textTheme.bodySmall?.copyWith(fontSize: 10, color: t.colorScheme.onSurfaceVariant)),
-      if (label == 'Интернет' && internetOk && publicIp.isNotEmpty)
-        Padding(
-          padding: const EdgeInsets.only(top: 4),
-          child: SelectableText('IP: $publicIp', style: TextStyle(fontSize: 10, color: t.colorScheme.onSurfaceVariant, fontFamily: 'monospace')),
-        ),
+  Widget _statusRow2(ThemeData t) => Row(children: [
+    _miniWidget(t, Icons.dns, 'DNS', dnsServers, t.colorScheme.tertiary),
+    const SizedBox(width: 8),
+    _miniWidget(t, Icons.wifi_tethering, 'Помехи', interferenceLevel, interferenceColor),
+    const SizedBox(width: 8),
+    _miniWidget(t, Icons.wifi, 'WiFi сети', wifi24Name != '—' ? '2.4: $wifi24Name' : '—', t.colorScheme.primary, sub: wifi5Name != '—' ? '5: $wifi5Name' : null),
+  ]);
+
+  Widget _miniWidget(ThemeData t, IconData icon, String label, String value, Color color, {String? sub, String? ip}) => Expanded(
+    child: Card(child: Padding(padding: const EdgeInsets.all(10), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Icon(icon, size: 18, color: color),
+        const SizedBox(width: 6),
+        Text(label, style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.onSurfaceVariant, fontSize: 11)),
+      ]),
+      const SizedBox(height: 4),
+      if (ip != null && ip.isNotEmpty)
+        SelectableText(ip, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, fontFamily: 'monospace', color: color), maxLines: 1),
+      if ((ip == null || ip.isEmpty) && value.isNotEmpty)
+        Text(value, style: t.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w700, fontSize: 12), maxLines: 2, overflow: TextOverflow.ellipsis),
+      if (sub != null) Text(sub, style: TextStyle(fontSize: 10, color: t.colorScheme.onSurfaceVariant)),
     ]))),
   );
 

@@ -142,31 +142,35 @@ class _NetworkScreenState extends State<NetworkScreen> {
   }
 
   Future<void> _speedtest() async {
-    // Сначала проверяем
     showDialog(context: context, barrierDismissible: false, builder: (ctx) => const AlertDialog(content: Row(children: [CircularProgressIndicator(), SizedBox(width: 16), Text('Проверка speedtest...')])));
     try {
       await widget.service.connect();
-      final hasSpeedtest = await widget.service.runCommand('(type speedtest-netperf || test -x /usr/sbin/speedtest-netperf || test -x /usr/bin/speedtest-netperf) >/dev/null 2>&1 && echo OK || echo NO');
+      // Проверяем все доступные методы
+      String? availableMethod;
+      for (final method in ['iperf3', 'speedtest-netperf', 'curl', 'wget']) {
+        final check = await widget.service.runCommand('(type $method || command -v $method || test -x /usr/bin/$method || test -x /usr/sbin/$method) >/dev/null 2>&1 && echo OK || echo NO');
+        if (check.trim() == 'OK') { availableMethod = method; break; }
+      }
+
       if (!mounted) return;
       Navigator.pop(context);
 
-      if (hasSpeedtest.trim() != 'OK') {
+      if (availableMethod == null) {
         final install = await showDialog<bool>(
           context: context,
           builder: (ctx) => AlertDialog(
-            title: const Text('speedtest-netperf не найден'),
-            content: const Text('Установить пакет speedtest-netperf? (~500 КБ)'),
+            title: const Text('Не найден speedtest'),
+            content: const Text('Установить iperf3? (наиболее надёжный)\n\nТакже доступны: curl, speedtest-netperf, wget'),
             actions: [
               TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Отмена')),
-              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Установить')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Установить iperf3')),
             ],
           ),
         );
         if (install != true) return;
-
-        showDialog(context: context, barrierDismissible: false, builder: (ctx) => const AlertDialog(content: Row(children: [CircularProgressIndicator(), SizedBox(width: 16), Text('Установка speedtest-netperf...')])));
+        showDialog(context: context, barrierDismissible: false, builder: (ctx) => const AlertDialog(content: Row(children: [CircularProgressIndicator(), SizedBox(width: 16), Text('Установка iperf3...')])));
         try {
-          await widget.service.installPackages(['speedtest-netperf']);
+          await widget.service.installPackages(['iperf3']);
           if (!mounted) return;
           Navigator.pop(context);
         } catch (e) {
@@ -177,15 +181,14 @@ class _NetworkScreenState extends State<NetworkScreen> {
         }
       }
 
-      // Запускаем тест
-      showDialog(context: context, barrierDismissible: false, builder: (ctx) => const AlertDialog(content: Row(children: [CircularProgressIndicator(), SizedBox(width: 16), Text('Speedtest... (~10 сек)')])));
+      showDialog(context: context, barrierDismissible: false, builder: (ctx) => const AlertDialog(content: Row(children: [CircularProgressIndicator(), SizedBox(width: 16), Text('Speedtest... (~10-30 сек)')])));
       final result = await widget.service.runSpeedtest();
       if (!mounted) return;
       Navigator.pop(context);
       showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('Результат Speedtest'),
+          title: const Text('Speedtest'),
           content: SingleChildScrollView(child: SelectableText(result)),
           actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
         ),
